@@ -1,0 +1,46 @@
+# Configuración de Prometheus para monitoreo
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  # - "rules.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+
+scrape_configs:
+  # Monitorear la app Next.js
+  - job_name: 'rag-app'
+    static_configs:
+      - targets: ['rag-app:3000']
+    metrics_path: '/api/health'
+    scrape_interval: 30s
+
+  # Monitorear PostgreSQL (requiere exporter)
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+    scrape_interval: 30s
+
+  # Monitorear Ollama
+  - job_name: 'ollama'
+    static_configs:
+      - targets: ['ollama:11434']
+    metrics_path: '/api/tags'
+    scrape_interval: 60s
+
+  # Monitorear ChromaDB
+  - job_name: 'chromadb'
+    static_configs:
+      - targets: ['chromadb:8000']
+    metrics_path: '/api/v1/heartbeat'
+    scrape_interval: 30s
+
+  # Monitorear Prometheus a sí mismo
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

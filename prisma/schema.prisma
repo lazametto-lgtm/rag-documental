@@ -1,0 +1,268 @@
+// Prisma schema — Sistema RAG documental
+// SQLite local con persistencia de metadatos y chunks.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Colección lógica de documentos (p. ej. "balances-2023", "contratos-comerciales")
+model Collection {
+  id          String     @id @default(cuid())
+  name        String     @unique
+  description String?
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  documents   Document[]
+}
+
+model Document {
+  id           String   @id @default(cuid())
+  title        String
+  // Tipo: BALANCE | CONTRACT | REGULATION | OTHER
+  docType      String   @default("OTHER")
+  // Metadatos obligatorios por chunk a nivel documento
+  jurisdiction String?
+  entity       String?
+  period       String?
+  version      String?
+  validityDate DateTime?
+  // Vigencia: VIGENT | SUPERSEDED | DRAFT
+  status       String   @default("VIGENT")
+  // Fuente
+  sourcePath   String?
+  contentHash  String   @unique
+  // Estadísticas
+  chunkCount   Int      @default(0)
+  pageCount    Int      @default(1)
+  // Texto crudo extraído (para vista previa y re-indexado)
+  rawText      String?
+  // Favorito (star del usuario)
+  favorite     Boolean  @default(false)
+  // Tags personalizados (JSON array de strings)
+  tags         String   @default("[]")
+  // Soft delete
+  deletedAt    DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  collectionId String?
+  collection   Collection? @relation(fields: [collectionId], references: [id], onDelete: SetNull)
+
+  chunks       Chunk[]
+  queryLogs    QueryLog[]
+
+  @@index([docType])
+  @@index([jurisdiction])
+  @@index([entity])
+  @@index([status])
+  @@index([collectionId])
+  @@index([favorite])
+}
+
+model Chunk {
+  id          String   @id @default(cuid())
+  documentId  String
+  // Contenido textual del fragmento
+  content     String
+  // Tipo de chunk: TEXT | TABLE | HEADING | CLAUSE | ARTICLE | SECTION | FOOTNOTE
+  chunkType   String   @default("TEXT")
+  // Ubicación
+  page        Int      @default(1)
+  section     String?
+  clauseRef   String?
+  order       Int      @default(0)
+  // Embedding denso serializado como JSON (array de números)
+  embedding   String
+  // Metadatos extendidos (JSON string)
+  metadata    String   @default("{}")
+  // Token count estimado (4 chars ≈ 1 token)
+  tokenCount  Int      @default(0)
+  // Norma L2 del embedding (para cosine sim)
+  norm        Float    @default(0)
+  createdAt   DateTime @default(now())
+
+  document    Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  queryLogs   QueryLog[]
+
+  @@index([documentId])
+  @@index([chunkType])
+  @@index([page])
+}
+
+// Preguntas de evaluación con respuesta esperada (dataset RAGAS-like)
+model EvaluationQuestion {
+  id              String   @id @default(cuid())
+  question        String
+  expectedAnswer  String
+  expectedDocType String?
+  // Etiquetas para agrupar (balances, contratos, normativas)
+  tags           String?
+  createdAt       DateTime @default(now())
+}
+
+// Log de cada consulta realizada (para trazabilidad)
+model QueryLog {
+  id              String   @id @default(cuid())
+  question        String
+  // JSON: { answer, citations, confidence, warnings, latencyMs, retrievedChunks }
+  response        String
+  // Tipo de LLM usado
+  llmProvider     String   @default("zai-llm")
+  // Métricas
+  latencyMs       Int      @default(0)
+  retrievedCount  Int      @default(0)
+  createdAt       DateTime @default(now())
+
+  documentId      String?
+  document        Document? @relation(fields: [documentId], references: [id], onDelete: SetNull)
+
+  chunks          Chunk[]
+}
+
+// Resultado de una corrida de evaluación
+model EvaluationRun {
+  id              String   @id @default(cuid())
+  // JSON: { faithfulness, answerRelevancy, contextPrecision, citationAccuracy, perQuestion: [] }
+  metrics         String
+  questionCount   Int      @default(0)
+  createdAt       DateTime @default(now())
+}
+
+// ============================================================
+// MODELOS SaaS (suscripción B2B)
+// ============================================================
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String?
+  passwordHash  String?
+  role          String   @default("user") // user | admin
+  createdAt     DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  subscription  Subscription?
+  usageLogs     UsageLog[]
+}
+
+model Subscription {
+  id              String   @id @default(cuid())
+  userId          String   @unique
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Plan: free | pro | enterprise
+  plan            String   @default("free")
+
+  // Límites del plan (preestablecidos pero editables)
+  maxQueries      Int      @default(50)       // consultas por mes
+  maxDocuments    Int      @default(10)       // documentos máximos
+  maxChunks       Int      @default(200)      // chunks máximos indexados
+  features        String   @default("{}")     // JSON: { export, api, airgapped, eval }
+
+  // Stripe
+  stripeCustomerId   String?
+  stripeSubscriptionId String?
+  stripePriceId      String?
+
+  // Estado
+  status          String   @default("active")  // active | past_due | canceled
+  currentPeriodEnd DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model UsageLog {
+  id              String   @id @default(cuid())
+  userId          String?
+  user            User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  // Tipo de uso: query | ingest | search | eval
+  type            String
+  // Detalle (ej: pregunta hecha, documento ingestado)
+  detail          String?
+
+  // Tokens consumidos (para billing)
+  tokensIn        Int      @default(0)
+  tokensOut       Int      @default(0)
+  cost            Float   @default(0)  // costo en USD
+
+  createdAt       DateTime @default(now())
+
+  @@index([userId, type, createdAt])
+  @@index([createdAt])
+}
+
+// ============================================================
+// MODELOS WHITE-LABEL / REVENDEDOR
+// ============================================================
+
+model Reseller {
+  id              String   @id @default(cuid())
+  email           String   @unique
+  name            String
+  company         String?
+  // Comisión: % que se queda el revendedor (ej: 30 = 30%)
+  commissionPct   Float    @default(30)
+  // Estado: active | suspended | terminated
+  status          String   @default("active")
+  // Branding personalizable
+  brandName       String   @default("RAG Documental")
+  brandLogoUrl    String?
+  brandPrimaryColor String @default("#000000")
+  brandDomain     String?
+  // Stats
+  totalRevenue    Float    @default(0)
+  totalCustomers  Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  licenses        License[]
+  customers       ResellerCustomer[]
+}
+
+model License {
+  id              String   @id @default(cuid())
+  // Key único para validar (ej: RAG-XXXX-XXXX-XXXX)
+  licenseKey      String   @unique
+  resellerId      String
+  reseller        Reseller @relation(fields: [resellerId], references: [id], onDelete: Cascade)
+  // Cliente final que usa esta licencia
+  customerName    String
+  customerEmail   String
+  // Plan asignado
+  plan            String   @default("pro")  // free | pro | enterprise
+  // Vigencia
+  issuedAt       DateTime @default(now())
+  expiresAt      DateTime?
+  // Estado
+  status          String   @default("active")  // active | expired | revoked
+  // Revenue
+  monthlyFee      Float    @default(0)
+  // Límites personalizados (override del plan)
+  maxQueries      Int?
+  maxDocuments    Int?
+  maxChunks       Int?
+  // Metadatos
+  instanceUrl     String?  // URL donde está desplegado para este cliente
+  notes           String?
+  createdAt       DateTime @default(now())
+}
+
+model ResellerCustomer {
+  id              String   @id @default(cuid())
+  resellerId      String
+  reseller        Reseller @relation(fields: [resellerId], references: [id], onDelete: Cascade)
+  name            String
+  email           String
+  company         String?
+  plan            String   @default("pro")
+  monthlyFee     Float    @default(0)
+  status          String   @default("active")
+  createdAt       DateTime @default(now())
+}

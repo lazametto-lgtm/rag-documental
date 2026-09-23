@@ -1,0 +1,16 @@
+{
+  "name": "llm-local-server",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch index.ts",
+    "start": "tsx index.ts"
+  },
+  "dependencies": {
+    "z-ai-web-dev-sdk": "^0.0.18"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "@types/node": "^22"
+  }
+}

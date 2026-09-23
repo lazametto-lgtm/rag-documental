@@ -1,0 +1,297 @@
+# =============================================================================
+# Sistema RAG Documental — Despliegue On-Premise
+# PostgreSQL + Ollama (VPS con GPU) + App + Monitoreo
+# =============================================================================
+# Todo corre en tus propios servidores. Sin tráfico saliente.
+#
+# Uso:
+#   docker compose -f docker-compose.onpremise.yml --env-file .env.onpremise up -d
+#
+# Arquitectura:
+#
+#   ┌──────────────────────────────────────────────────────────┐
+#   │                 RED INTERNA (on-premise)                  │
+#   │                                                          │
+#   │  ┌─── INFERENCIA ──────────────────────────┐            │
+#   │  │  Ollama (GPU)    :11434                │            │
+#   │  │  LLM Local       :3031 (fallback)      │            │
+#   │  │  Router Híbrido  :3032                 │            │
+#   │  └─────────────────────────────────────────┘            │
+#   │                                                          │
+#   │  ┌─── DATOS ─────────────────────────────┐             │
+#   │  │  PostgreSQL 16   :5432                │             │
+#   │  │  ChromaDB       :8000 (vector DB)    │             │
+#   │  │  Volumen docs    (almacenamiento)     │             │
+#   │  └─────────────────────────────────────────┘            │
+#   │                                                          │
+#   │  ┌─── APLICACIÓN ────────────────────────┐             │
+#   │  │  Next.js (API+UI) :3000               │             │
+#   │  │  Air-gapped=true                        │             │
+#   │  └─────────────────────────────────────────┘            │
+#   │                                                          │
+#   │  ┌─── MONITOREO ────────────────────────┐             │
+#   │  │  Prometheus      :9090               │             │
+#   │  │  Grafana        :3001               │             │
+#   │  │  Uptime Kuma    :3001 (alt)          │             │
+#   │  └─────────────────────────────────────────┘            │
+#   └──────────────────────────────────────────────────────────┘
+# =============================================================================
+
+version: "3.9"
+
+networks:
+  rag-net:
+    driver: bridge
+    # internal: true  # Descomentar para air-gapped puro (sin Internet)
+
+volumes:
+  pgdata:
+  chromadata:
+  ollama-models:
+  doc-storage:
+  prometheus-data:
+  grafana-data:
+  kuma-data:
+
+services:
+  # ===========================================================================
+  # CAPA 1: INFERENCIA (Ollama con GPU)
+  # ===========================================================================
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: rag-ollama
+    restart: unless-stopped
+    networks: [rag-net]
+    volumes:
+      - ollama-models:/root/.ollama
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_ORIGINS=*
+      # Ajustar según tu GPU:
+      - OLLAMA_NUM_PARALLEL=2
+      - OLLAMA_MAX_LOADED_MODELS=2
+    # Descomendar si tienes GPU NVIDIA:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Servidor LLM local (wraps z-ai-web-dev-sdk como fallback)
+  llm-local:
+    build:
+      context: ./mini-services/llm-local
+      dockerfile: Dockerfile
+    container_name: rag-llm-local
+    restart: unless-stopped
+    networks: [rag-net]
+    ports:
+      - "3031:3031"
+    environment:
+      - PORT=3031
+
+  # Router híbrido (balancea local → ollama → api con fallback)
+  llm-hybrid:
+    build:
+      context: ./mini-services/llm-hybrid
+      dockerfile: Dockerfile
+    container_name: rag-llm-hybrid
+    restart: unless-stopped
+    networks: [rag-net]
+    ports:
+      - "3032:3032"
+    environment:
+      - PORT=3032
+      - LOCAL_URL=http://llm-local:3031
+      - OLLAMA_URL=http://ollama:11434
+    depends_on:
+      - llm-local
+      - ollama
+
+  # ===========================================================================
+  # CAPA 2: DATOS (PostgreSQL + ChromaDB)
+  # ===========================================================================
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: rag-postgres
+    restart: unless-stopped
+    networks: [rag-net]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Script de init (crear DB automáticamente):
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-ragdb}
+      - POSTGRES_USER=${POSTGRES_USER:-raguser}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-ragpass_cambiar}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-raguser}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: rag-chromadb
+    restart: unless-stopped
+    networks: [rag-net]
+    volumes:
+      - chromadata:/chroma/chroma
+    ports:
+      - "8000:8000"
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ===========================================================================
+  # CAPA 3: APLICACIÓN (Next.js)
+  # ===========================================================================
+
+  rag-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-app
+    restart: unless-stopped
+    networks: [rag-net]
+    ports:
+      - "3000:3000"
+    environment:
+      # Base de datos PostgreSQL
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-raguser}:${POSTGRES_PASSWORD:-ragpass_cambiar}@postgres:5432/${POSTGRES_DB:-ragdb}?schema=public
+      # LLM: Ollama (100% local, sin tráfico saliente)
+      - LLM_PROVIDER=hybrid
+      - HYBRID_SERVER_URL=http://llm-hybrid:3032
+      - LOCAL_SERVER_URL=http://llm-local:3031
+      - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3}
+      # ChromaDB
+      - CHROMA_URL=http://chromadb:8000
+      # Air-gapped
+      - AIR_GAPPED=true
+      # Telemetría OFF
+      - NEXT_TELEMETRY_DISABLED=1
+      # Stripe (si vas a cobrar)
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
+      - STRIPE_PRICE_PRO=${STRIPE_PRICE_PRO:-}
+      - STRIPE_PRICE_ENTERPRISE=${STRIPE_PRICE_ENTERPRISE:-}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
+      # App
+      - NEXTAUTH_URL=${NEXTAUTH_URL:-http://localhost:3000}
+      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:-cambiar_en_produccion}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+      llm-hybrid:
+        condition: service_started
+    volumes:
+      - doc-storage:/app/storage/documents
+
+  # ===========================================================================
+  # CAPA 4: MONITOREO (Prometheus + Grafana)
+  # ===========================================================================
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: rag-prometheus
+    restart: unless-stopped
+    networks: [rag-net]
+    volumes:
+      - prometheus-data:/prometheus
+      - ./scripts/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=30d'
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: rag-grafana
+    restart: unless-stopped
+    networks: [rag-net]
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3001:3001"
+    environment:
+      - GF_SERVER_HTTP_PORT=3001
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASS:-admin}
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    depends_on:
+      - prometheus
+
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: rag-uptime-kuma
+    restart: unless-stopped
+    networks: [rag-net]
+    volumes:
+      - kuma-data:/app/data
+    ports:
+      - "3002:3001"
+
+# =============================================================================
+# NOTAS DE DESPLIEGUE ON-PREMISE:
+#
+# 1. HARDWARE MÍNIMO:
+#    - CPU: 8 cores (16+ si Ollama corre en misma máquina)
+#    - RAM: 16 GB mínimo (32+ para Ollama con Llama 3 8B)
+#    - Disco: 100 GB SSD (500+ para muchos documentos)
+#    - GPU: NVIDIA con 8GB+ VRAM (para Ollama, recomendado pero no obligatorio)
+#
+# 2. PRE-CARGA DE IMÁGENES DOCKER:
+#    docker pull ollama/ollama:latest
+#    docker pull postgres:16-alpine
+#    docker pull chromadb/chroma:latest
+#    docker pull prom/prometheus:latest
+#    docker pull grafana/grafana:latest
+#    docker pull louislam/uptime-kuma:1
+#    docker save -o images.tar ollama/ollama postgres:16-alpine chromadb/chroma prom/prometheus grafana/grafana louislam/uptime-kuma:1
+#    # Transferir images.tar al servidor on-premise
+#    docker load -i images.tar
+#
+# 3. PRE-CARGA DE MODELO OLLAMA:
+#    # En máquina con Internet:
+#    docker run -v ollama-models:/root/.ollama ollama/ollama pull llama3
+#    # O si ya está corriendo Ollama:
+#    ollama pull llama3
+#    # El modelo se guarda en el volumen ollama-models
+#
+# 4. SI TIENES GPU NVIDIA:
+#    # Instalar NVIDIA Container Toolkit:
+#    # https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+#    # Descomentar la sección "deploy.resources" del servicio ollama
+#
+# 5. BACKUP AUTOMÁTICO:
+#    # Agregar a crontab:
+#    0 3 * * * docker exec rag-postgres pg_dump -U raguser ragdb > /backups/ragdb_$(date +\%Y\%m\%d).sql
+#
+# 6. MONITOREO:
+#    - Prometheus: http://servidor:9090 (métricas)
+#    - Grafana: http://servidor:3001 (dashboards, user: admin / pass: admin)
+#    - Uptime Kuma: http://servidor:3002 (alerts por email/Telegram)
+# =============================================================================

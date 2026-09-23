@@ -1,0 +1,194 @@
+# =============================================================================
+# Sistema RAG Documental — Despliegue Air-Gapped (3 capas)
+# =============================================================================
+# Todo corre dentro de una red aislada (air-gapped). Sin tráfico saliente.
+#
+# Capas:
+#   1. Inferencia: Ollama (LLM local), servidor de embeddings, reranker
+#   2. Datos: PostgreSQL, ChromaDB (vector DB), volumen de documentos
+#   3. Aplicación: Next.js (API + UI + orquestación)
+#
+# Uso:
+#   docker compose -f docker-compose.airgapped.yml --env-file .env.airgapped up -d
+#
+# Requisitos previos:
+#   - Docker + Docker Compose instalado en la máquina air-gapped
+#   - Imágenes pre-cargadas (sin acceso a Docker Hub)
+#   - Modelo Ollama pre-descargado (ej: ollama pull llama3)
+# =============================================================================
+
+version: "3.9"
+
+networks:
+  rag-internal:
+    driver: bridge
+    internal: true  # ← RED AISLADA: sin acceso a Internet
+
+volumes:
+  pgdata:
+  chromadata:
+  ollama-models:
+  doc-storage:
+
+services:
+  # ===========================================================================
+  # CAPA 1: INFERENCIA
+  # ===========================================================================
+
+  # Ollama — LLM local (Llama 3, DeepSeek, etc.)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: rag-ollama
+    restart: unless-stopped
+    networks: [rag-internal]
+    volumes:
+      - ollama-models:/root/.ollama
+    ports:
+      - "11434:11434"  # Solo si se necesita acceso desde host
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_ORIGINS=*
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Servidor LLM local (wraps z-ai-web-dev-sdk → disponible como API REST)
+  # Solo si se usa el SDK en lugar de Ollama
+  llm-local:
+    build:
+      context: ./mini-services/llm-local
+      dockerfile: Dockerfile
+    container_name: rag-llm-local
+    restart: unless-stopped
+    networks: [rag-internal]
+    ports:
+      - "3031:3031"
+    environment:
+      - PORT=3031
+
+  # Router híbrido (balancea entre llm-local, ollama y API — fallback automático)
+  llm-hybrid:
+    build:
+      context: ./mini-services/llm-hybrid
+      dockerfile: Dockerfile
+    container_name: rag-llm-hybrid
+    restart: unless-stopped
+    networks: [rag-internal]
+    ports:
+      - "3032:3032"
+    environment:
+      - PORT=3032
+      - LOCAL_URL=http://llm-local:3031
+      - OLLAMA_URL=http://ollama:11434
+    depends_on:
+      - llm-local
+      - ollama
+
+  # ===========================================================================
+  # CAPA 2: DATOS
+  # ===========================================================================
+
+  # PostgreSQL — base de datos principal (documentos, chunks, metadatos, logs)
+  postgres:
+    image: postgres:16-alpine
+    container_name: rag-postgres
+    restart: unless-stopped
+    networks: [rag-internal]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-ragdb}
+      - POSTGRES_USER=${POSTGRES_USER:-raguser}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-ragpass}
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-raguser}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ChromaDB — base de datos vectorial (alternativa al in-memory)
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: rag-chromadb
+    restart: unless-stopped
+    networks: [rag-internal]
+    volumes:
+      - chromadata:/chroma/chroma
+    ports:
+      - "8000:8000"
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE  # ← Sin telemetría saliente
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ===========================================================================
+  # CAPA 3: APLICACIÓN (Next.js: API + UI + orquestación)
+  # ===========================================================================
+
+  rag-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-app
+    restart: unless-stopped
+    networks: [rag-internal]
+    ports:
+      - "3000:3000"  # Único puerto expuesto al host
+    environment:
+      # Modo air-gapped: bloquea tráfico saliente
+      - AIR_GAPPED=true
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-raguser}:${POSTGRES_PASSWORD:-ragpass}@postgres:5432/${POSTGRES_DB:-ragdb}?schema=public
+      # Proveedores LLM (todos locales)
+      - LLM_PROVIDER=hybrid
+      - HYBRID_SERVER_URL=http://llm-hybrid:3032
+      - LOCAL_SERVER_URL=http://llm-local:3031
+      - OLLAMA_URL=http://ollama:11434
+      # ChromaDB (opcional, si se usa en lugar de in-memory)
+      - CHROMA_URL=http://chromadb:8000
+      # Sin telemetría
+      - NEXT_TELEMETRY_DISABLED=1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+      llm-hybrid:
+        condition: service_started
+    volumes:
+      - doc-storage:/app/storage/documents
+
+# =============================================================================
+# NOTAS DE DESPLIEGUE AIR-GAPPED:
+#
+# 1. PRE-CARGA DE IMÁGENES:
+#    En una máquina con Internet, descargar las imágenes y transferirlas:
+#    docker pull ollama/ollama:latest
+#    docker pull postgres:16-alpine
+#    docker pull chromadb/chroma:latest
+#    docker save -o images.tar ollama/ollama:latest postgres:16-alpine chromadb/chroma:latest
+#    # Transferir images.tar a la máquina air-gapped
+#    docker load -i images.tar
+#
+# 2. PRE-CARGA DE MODELO OLLAMA:
+#    ollama pull llama3  # En máquina con Internet
+#    # Copiar ~/.ollama/models/ a la máquina air-gapped
+#    # Montar en volumen ollama-models
+#
+# 3. RED INTERNAL: true bloquea TODO tráfico saliente del contenedor.
+#    Solo se permite tráfico entre servicios en la red rag-internal.
+#
+# 4. PUERTOS: Solo el puerto 3000 (app) necesita estar expuesto al host.
+#    Los demás puertos son internos de la red Docker.
+#
+# 5. SIN TELEMETRÍA: Next_TELEMETRY_DISABLED=1, ChromaDB ANONYMIZED_TELEMETRY=FALSE
+# =============================================================================
